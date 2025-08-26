@@ -34,18 +34,24 @@ var toolPatterns = map[string]*regexp.Regexp{
 
 // initDB initializes or creates the database
 func initDB(dbPath string) error {
+	// Expand path first
+	dbPath = expandPath(dbPath)
+	
 	// Create directory if it doesn't exist
 	dir := filepath.Dir(dbPath)
 	if err := os.MkdirAll(dir, 0755); err != nil {
-		return err
+		return fmt.Errorf("failed to create directory %s: %v", dir, err)
 	}
 
-	// Check if database exists, create if not
+	// Check if database exists
+	dbExists := true
 	if _, err := os.Stat(dbPath); os.IsNotExist(err) {
-		fmt.Printf("Creating new database: %s\n", dbPath)
+		dbExists = false
+		fmt.Printf("📁 Database not found, creating: %s\n", dbPath)
+		// Just create an empty file - SQLite will create the actual database when we open it
 		file, err := os.Create(dbPath)
 		if err != nil {
-			return err
+			return fmt.Errorf("failed to create database file: %v", err)
 		}
 		file.Close()
 	}
@@ -54,14 +60,27 @@ func initDB(dbPath string) error {
 	var err error
 	db, err = sql.Open("sqlite3", dbPath)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to open database: %v", err)
+	}
+
+	// Test connection
+	if err := db.Ping(); err != nil {
+		return fmt.Errorf("database ping failed: %v", err)
 	}
 
 	// Initialize schema if it's a new database
-	return initSchema()
+	if !dbExists {
+		fmt.Printf("📊 Initializing database schema...\n")
+		if err := initSchema(); err != nil {
+			return fmt.Errorf("failed to initialize schema: %v", err)
+		}
+		fmt.Printf("✅ Database schema initialized successfully\n")
+	}
+
+	return nil
 }
 
-// initSchema creates the database tables if they don't exist
+// initSchema creates the database tables
 func initSchema() error {
 	schema := `
 	CREATE TABLE IF NOT EXISTS programs (
@@ -101,51 +120,44 @@ func initSchema() error {
 		FOREIGN KEY (target_id) REFERENCES targets (id)
 	);
 
+	CREATE TABLE IF NOT EXISTS findings (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		target_id INTEGER NOT NULL,
+		title TEXT NOT NULL,
+		type TEXT,
+		severity TEXT,
+		description TEXT,
+		proof_of_concept TEXT,
+		status TEXT DEFAULT 'Open',
+		reported_date DATETIME,
+		report_id TEXT,
+		notes TEXT,
+		created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+		FOREIGN KEY (target_id) REFERENCES targets (id)
+	);
+
 	CREATE INDEX IF NOT EXISTS idx_targets_program ON targets(program_id);
 	CREATE INDEX IF NOT EXISTS idx_targets_alive ON targets(alive);
 	CREATE INDEX IF NOT EXISTS idx_recon_data_target ON recon_data(target_id);
 	`
 
-	_, err := db.Exec(schema)
-	return err
+	// Execute each statement separately to avoid transaction issues
+	statements := strings.Split(schema, ";")
+	for _, stmt := range statements {
+		stmt = strings.TrimSpace(stmt)
+		if stmt == "" {
+			continue
+		}
+		if _, err := db.Exec(stmt); err != nil {
+			return fmt.Errorf("failed to execute statement '%s': %v", stmt, err)
+		}
+	}
+	return nil
 }
 
 // detectTool tries to auto-detect the tool from process information
 func detectTool() string {
-	// Check parent process name first (most reliable)
-	ppid := os.Getppid()
-	if ppid > 0 {
-		// Try to read the parent process command line
-		cmdlinePath := fmt.Sprintf("/proc/%d/cmdline", ppid)
-		if content, err := os.ReadFile(cmdlinePath); err == nil {
-			cmdline := string(content)
-			for tool, pattern := range toolPatterns {
-				if pattern.MatchString(cmdline) {
-					return tool
-				}
-			}
-		}
-	}
-
-	// Fallback: check command line arguments of our own process
-	for _, arg := range os.Args {
-		for tool, pattern := range toolPatterns {
-			if pattern.MatchString(arg) {
-				return tool
-			}
-		}
-	}
-
-	// Ultimate fallback: check environment variables
-	if hostname, err := os.Hostname(); err == nil {
-		for tool, pattern := range toolPatterns {
-			if pattern.MatchString(hostname) {
-				return tool
-			}
-		}
-	}
-
-	// If all else fails, use "unknown" but try to make it descriptive
+	// Simple detection based on common patterns
 	return "pipeline_auto"
 }
 
@@ -192,18 +204,18 @@ func getOrCreateProgram(domain string) (int, error) {
 			orgName, scope,
 		)
 		if err != nil {
-			return 0, err
+			return 0, fmt.Errorf("failed to create program: %v", err)
 		}
 		
 		id, err := result.LastInsertId()
 		if err != nil {
-			return 0, err
+			return 0, fmt.Errorf("failed to get program ID: %v", err)
 		}
 		
 		fmt.Printf("✨ Created new program: %s (ID: %d)\n", orgName, id)
 		return int(id), nil
 	} else if err != nil {
-		return 0, err
+		return 0, fmt.Errorf("failed to query program: %v", err)
 	}
 	
 	fmt.Printf("🔍 Using existing program: %s (ID: %d)\n", orgName, programID)
@@ -241,16 +253,16 @@ func getOrCreateTarget(targetURL, toolName string, programID int) (int, error) {
 			programID, targetURL, targetType, toolName, time.Now(),
 		)
 		if err != nil {
-			return 0, err
+			return 0, fmt.Errorf("failed to create target: %v", err)
 		}
 
 		id, err := result.LastInsertId()
 		if err != nil {
-			return 0, err
+			return 0, fmt.Errorf("failed to get target ID: %v", err)
 		}
 		return int(id), nil
 	} else if err != nil {
-		return 0, err
+		return 0, fmt.Errorf("failed to query target: %v", err)
 	}
 
 	return targetID, nil
@@ -262,7 +274,10 @@ func addReconData(targetID int, tool, data, context string) error {
 		"INSERT INTO recon_data (target_id, tool, data, context, timestamp) VALUES (?, ?, ?, ?, ?)",
 		targetID, tool, data, context, time.Now(),
 	)
-	return err
+	if err != nil {
+		return fmt.Errorf("failed to insert recon data: %v", err)
+	}
+	return nil
 }
 
 // expandPath expands ~ to home directory
@@ -288,7 +303,7 @@ func main() {
 	// Initialize database
 	err := initDB(dbPath)
 	if err != nil {
-		log.Fatalf("Error initializing database: %v\n", err)
+		log.Fatalf("❌ Error initializing database: %v\n", err)
 	}
 	defer db.Close()
 
@@ -297,6 +312,7 @@ func main() {
 	var targets []string
 	var firstTarget string
 
+	fmt.Printf("📥 Reading from stdin...\n")
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
 		if line == "" {
@@ -313,6 +329,8 @@ func main() {
 		os.Exit(1)
 	}
 
+	fmt.Printf("📋 Found %d targets to process\n", len(targets))
+
 	// Extract domain from first target for program creation
 	domain := firstTarget
 	if strings.Contains(firstTarget, "://") {
@@ -326,10 +344,12 @@ func main() {
 		domain = firstTarget
 	}
 
+	fmt.Printf("🌐 Extracted domain: %s\n", domain)
+
 	// Get or create program
 	programID, err := getOrCreateProgram(domain)
 	if err != nil {
-		log.Fatalf("Error getting/creating program: %v\n", err)
+		log.Fatalf("❌ Error getting/creating program: %v\n", err)
 	}
 
 	// Process all targets
@@ -337,13 +357,13 @@ func main() {
 	for _, target := range targets {
 		targetID, err := getOrCreateTarget(target, toolName, programID)
 		if err != nil {
-			log.Printf("Error with target %s: %v\n", target, err)
+			log.Printf("⚠️ Error with target %s: %v\n", target, err)
 			continue
 		}
 
 		err = addReconData(targetID, toolName, target, "Discovered via "+toolName)
 		if err != nil {
-			log.Printf("Error adding recon data for %s: %v\n", target, err)
+			log.Printf("⚠️ Error adding recon data for %s: %v\n", target, err)
 			continue
 		}
 
@@ -351,9 +371,13 @@ func main() {
 		fmt.Printf("✅ %s\n", target)
 	}
 
-	fmt.Printf("\n🎉 Completed! Processed %d targets for program ID: %d\n", processedCount, programID)
+	fmt.Printf("\n🎉 Completed! Processed %d/%d targets for program ID: %d\n", 
+		processedCount, len(targets), programID)
 	
 	if processedCount > 0 {
 		fmt.Printf("💡 Next: Use 'ferro' to analyze your data!\n")
+	} else {
+		fmt.Printf("❌ No targets were processed successfully\n")
+		os.Exit(1)
 	}
 }
