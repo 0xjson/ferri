@@ -32,9 +32,8 @@ var toolPatterns = map[string]*regexp.Regexp{
 	"gobuster":    regexp.MustCompile(`gobuster|dirbust`),
 }
 
-// initDB initializes or creates the database
-func initDB(dbPath string) error {
-	// Expand path first
+// ensureDBExists creates the database file and schema if it doesn't exist
+func ensureDBExists(dbPath string) error {
 	dbPath = expandPath(dbPath)
 	
 	// Create directory if it doesn't exist
@@ -43,20 +42,46 @@ func initDB(dbPath string) error {
 		return fmt.Errorf("failed to create directory %s: %v", dir, err)
 	}
 
-	// Check if database exists
-	dbExists := true
-	if _, err := os.Stat(dbPath); os.IsNotExist(err) {
-		dbExists = false
-		fmt.Printf("📁 Database not found, creating: %s\n", dbPath)
-		// Just create an empty file - SQLite will create the actual database when we open it
-		file, err := os.Create(dbPath)
-		if err != nil {
-			return fmt.Errorf("failed to create database file: %v", err)
-		}
-		file.Close()
+	// Check if database already exists
+	if _, err := os.Stat(dbPath); err == nil {
+		return nil // Database already exists
 	}
 
+	fmt.Printf("📁 Database not found, creating: %s\n", dbPath)
+	
+	// Create an empty file
+	file, err := os.Create(dbPath)
+	if err != nil {
+		return fmt.Errorf("failed to create database file: %v", err)
+	}
+	file.Close()
+
 	// Open database
+	db, err := sql.Open("sqlite3", dbPath)
+	if err != nil {
+		return fmt.Errorf("failed to open database: %v", err)
+	}
+	defer db.Close()
+
+	// Test connection
+	if err := db.Ping(); err != nil {
+		return fmt.Errorf("database ping failed: %v", err)
+	}
+
+	// Initialize schema
+	fmt.Printf("📊 Initializing database schema...\n")
+	if err := initSchema(db); err != nil {
+		return fmt.Errorf("failed to initialize schema: %v", err)
+	}
+	fmt.Printf("✅ Database created and schema initialized successfully\n")
+	
+	return nil
+}
+
+// initDB initializes the database connection
+func initDB(dbPath string) error {
+	dbPath = expandPath(dbPath)
+	
 	var err error
 	db, err = sql.Open("sqlite3", dbPath)
 	if err != nil {
@@ -68,20 +93,11 @@ func initDB(dbPath string) error {
 		return fmt.Errorf("database ping failed: %v", err)
 	}
 
-	// Initialize schema if it's a new database
-	if !dbExists {
-		fmt.Printf("📊 Initializing database schema...\n")
-		if err := initSchema(); err != nil {
-			return fmt.Errorf("failed to initialize schema: %v", err)
-		}
-		fmt.Printf("✅ Database schema initialized successfully\n")
-	}
-
 	return nil
 }
 
 // initSchema creates the database tables
-func initSchema() error {
+func initSchema(db *sql.DB) error {
 	schema := `
 	CREATE TABLE IF NOT EXISTS programs (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -292,17 +308,44 @@ func expandPath(path string) string {
 	return path
 }
 
+// hasStdinData checks if there's data available on stdin
+func hasStdinData() bool {
+	stat, _ := os.Stdin.Stat()
+	return (stat.Mode() & os.ModeCharDevice) == 0
+}
+
 func main() {
-	// Auto-detect everything!
 	dbPath := expandPath(defaultDBPath)
+	
+	// Check if there's any data on stdin
+	if !hasStdinData() {
+		fmt.Printf("📭 No input provided via stdin\n")
+		fmt.Printf("💾 Ensuring database exists: %s\n", dbPath)
+		
+		// Ensure database exists before exiting
+		if err := ensureDBExists(dbPath); err != nil {
+			log.Fatalf("❌ Error ensuring database exists: %v\n", err)
+		}
+		
+		fmt.Printf("✅ Database is ready for use\n")
+		fmt.Printf("💡 Usage: echo 'example.com' | ferri\n")
+		fmt.Printf("💡 Usage: subfinder -d example.com | ferri\n")
+		os.Exit(0)
+	}
+
+	// There is stdin data, proceed with normal processing
 	toolName := detectTool()
 
 	fmt.Printf("🛠️  Auto-detected tool: %s\n", toolName)
 	fmt.Printf("💾 Database: %s\n", dbPath)
 
-	// Initialize database
-	err := initDB(dbPath)
-	if err != nil {
+	// Ensure database exists
+	if err := ensureDBExists(dbPath); err != nil {
+		log.Fatalf("❌ Error ensuring database exists: %v\n", err)
+	}
+
+	// Initialize database connection
+	if err := initDB(dbPath); err != nil {
 		log.Fatalf("❌ Error initializing database: %v\n", err)
 	}
 	defer db.Close()
@@ -325,7 +368,7 @@ func main() {
 	}
 
 	if len(targets) == 0 {
-		fmt.Println("❌ No input provided via stdin")
+		fmt.Println("❌ No valid targets found in stdin")
 		os.Exit(1)
 	}
 
